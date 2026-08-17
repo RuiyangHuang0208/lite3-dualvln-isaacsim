@@ -1,4 +1,5 @@
 diff --git a/internnav/agent/internvla_n1_agent_realworld.py b/internnav/agent/internvla_n1_agent_realworld.py
+index 1cb71c1..532884a 100644
 --- a/internnav/agent/internvla_n1_agent_realworld.py
 +++ b/internnav/agent/internvla_n1_agent_realworld.py
 @@ -31,7 +31,10 @@ class InternVLAN1AsyncAgent:
@@ -7,43 +8,77 @@ diff --git a/internnav/agent/internvla_n1_agent_realworld.py b/internnav/agent/i
              torch_dtype=torch.bfloat16,
 -            attn_implementation="flash_attention_2",
 +            # ==================== RTX 5090 兼容修改（开始） ====================
-+            # 使用 PyTorch SDPA，避免加载与本机 PyTorch/CUDA ABI 不兼容的 flash-attn wheel。
++            # 使用 PyTorch SDPA，避免加载与 PyTorch 2.7/cu128 ABI 不兼容的 flash-attn wheel。
 +            attn_implementation="sdpa",
 +            # ==================== RTX 5090 兼容修改（结束） ====================
              device_map={"": self.device},
          )
          self.model.eval()
-@@ -157,6 +160,11 @@ class InternVLAN1AsyncAgent:
+@@ -44,6 +47,11 @@ class InternVLAN1AsyncAgent:
+         self.resize_h = args.resize_h
+         self.num_history = args.num_history
+         self.PLAN_STEP_GAP = args.plan_step_gap
++        # ==================== 中文修改：System 1 候选轨迹显存控制（开始） ====================
++        # 官方默认32条；Isaac Sim 联合运行时由外部包装器降低，避免 CFG 批次翻倍后 OOM。
++        self.num_sample_trajs = getattr(args, "num_sample_trajs", 32)
++        self.num_inference_steps = getattr(args, "num_inference_steps", 10)
++        # ==================== 中文修改：System 1 候选轨迹显存控制（结束） ====================
+ 
+         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint's coordinates in the image. Please output STOP when you have successfully completed the task."
+         answer = ""
+@@ -157,6 +165,11 @@ class InternVLAN1AsyncAgent:
                  .unsqueeze(-1)
                  .to(self.device)
              )
 +            # ==================== 中文修改：System 1 推理前释放缓存（开始） ====================
-+            # System 2 已禁用 KV cache；归还不活跃缓存块，降低轨迹扩散模型峰值显存。
++            # System 2 已禁用 KV cache；这里再归还不活跃的 CUDA 缓存块，降低轨迹扩散模型峰值显存。
 +            if torch.cuda.is_available():
 +                torch.cuda.empty_cache()
 +            # ==================== 中文修改：System 1 推理前释放缓存（结束） ====================
              trajectories = self.step_s1(self.output_latent, rgbs, depths)
  
              dual_sys_output.output_trajectory = traj_to_actions(trajectories, use_discrate_action=False)
-@@ -222,7 +230,10 @@ class InternVLAN1AsyncAgent:
+@@ -222,7 +235,11 @@ class InternVLAN1AsyncAgent:
                  **inputs,
                  max_new_tokens=128,
                  do_sample=False,
 -                # use_cache=True,
 +                # ==================== Isaac + DualVLN 联合显存优化（开始） ====================
-+                # 当前实时包装器没有复用 past_key_values；关闭缓存，为 System 1 留显存。
++                # 当前实时包装器每次都会重建 conversation，且没有复用 past_key_values。
++                # 禁用 KV cache 可避免在 RTX 5090 上与 Isaac 同时运行时占用数 GB 无效显存。
 +                use_cache=False,
 +                # ==================== Isaac + DualVLN 联合显存优化（结束） ====================
                  # past_key_values=self.past_key_values,
                  return_dict_in_generate=True,
                  # raw_input_ids=copy.deepcopy(inputs.input_ids),
-@@ -236,5 +247,8 @@ class InternVLAN1AsyncAgent:
+@@ -236,7 +253,10 @@ class InternVLAN1AsyncAgent:
          with open(f"{self.save_dir}/llm_output_{self.episode_idx: 04d}.txt", 'w') as f:
              f.write(self.llm_output)
          self.last_output_ids = copy.deepcopy(output_ids[0])
 -        self.past_key_values = copy.deepcopy(outputs.past_key_values)
 +        # ==================== Isaac + DualVLN 联合显存优化（开始） ====================
-+        # use_cache=False 时不保存未使用的生成缓存。
++        # use_cache=False 时不保存未使用的生成缓存，给 System 1 trajectory 扩散模型留显存。
 +        self.past_key_values = None
 +        # ==================== Isaac + DualVLN 联合显存优化（结束） ====================
          print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")
+         if bool(re.search(r'\d', self.llm_output)):
+             coord = [int(c) for c in re.findall(r'\d+', self.llm_output)]
+@@ -253,5 +273,17 @@ class InternVLAN1AsyncAgent:
+             return action_seq, None, None
+ 
+     def step_s1(self, latent, rgb, depth):
+-        all_trajs = self.model.generate_traj(latent, rgb, depth)
++        # ==================== 中文修改：传入可配置的 System 1 采样规模（开始） ====================
++        # System 1 是纯推理；关闭 autograd，避免保留10步扩散计算图及 requires_grad 输出。
++        with torch.inference_mode():
++            all_trajs = self.model.generate_traj(
++                latent,
++                rgb,
++                depth,
++                num_sample_trajs=self.num_sample_trajs,
++                num_inference_steps=self.num_inference_steps,
++            )
++        # traj_to_actions 会原地缩放坐标；退出 inference_mode 后克隆成可写普通张量。
++        all_trajs = all_trajs.clone()
++        # ==================== 中文修改：传入可配置的 System 1 采样规模（结束） ====================
+         return all_trajs

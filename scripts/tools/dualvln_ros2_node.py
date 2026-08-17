@@ -82,15 +82,19 @@ def parse_args():
     # ==================== 中文修改：可移植路径参数（结束） ====================
     parser.add_argument("--max-vx", type=float, default=0.30)
     parser.add_argument("--max-wz", type=float, default=0.40)
+    # 中文修改：联合 Isaac Sim 时降低 System 1 候选轨迹数，官方默认值为32。
+    parser.add_argument("--system1-samples", type=int, default=8)
+    parser.add_argument("--system1-steps", type=int, default=10)
     args = parser.parse_args()
-    if args.max_vx <= 0.0 or args.max_wz <= 0.0:
-        parser.error("速度限制必须大于零")
+    if min(args.max_vx, args.max_wz, args.system1_samples, args.system1_steps) <= 0:
+        parser.error("速度限制、System 1 采样数和扩散步数必须大于零")
     return args
 
 
 def main():
     args = parse_args()
     import numpy as np
+    import torch
 
     # ==================== 中文修改：可移植路径解析（开始） ====================
     internnav_root = args.internnav_root.expanduser().resolve()
@@ -118,6 +122,8 @@ def main():
         resize_h=384,
         num_history=8,
         plan_step_gap=4,
+        num_sample_trajs=args.system1_samples,
+        num_inference_steps=args.system1_steps,
     )
     # ==================== DualVLN 模型参数：保持与官方 demo 一致（结束） ====================
 
@@ -149,22 +155,52 @@ def main():
                         started = time.monotonic()
 
                         # ==================== DualVLN 推理及 trajectory→cmd_vel（开始） ====================
-                        output = agent.step(rgb, depth, pose, args.instruction, intrinsic=intrinsic)
-                        # System 2 的“↓”(动作 5)表示请求向下观察，而不是让机器人倒车。
-                        # 立即送入独立下视相机图像，使模型继续生成 pixel goal / trajectory。
-                        if output.output_action and 5 in output.output_action:
-                            output = agent.step(
-                                look_down_rgb,
-                                depth,
-                                pose,
-                                args.instruction,
-                                intrinsic=intrinsic,
-                                look_down=True,
-                            )
+                        try:
+                            output = agent.step(rgb, depth, pose, args.instruction, intrinsic=intrinsic)
+                            # System 2 的“↓”(动作 5)表示请求向下观察，而不是让机器人倒车。
+                            # 立即送入独立下视相机图像，使模型继续生成 pixel goal / trajectory。
+                            if output.output_action and 5 in output.output_action:
+                                output = agent.step(
+                                    look_down_rgb,
+                                    depth,
+                                    pose,
+                                    args.instruction,
+                                    intrinsic=intrinsic,
+                                    look_down=True,
+                                )
+                        except torch.OutOfMemoryError as error:
+                            # ==================== 中文修改：System 1 OOM 安全降级（开始） ====================
+                            # 不让推理服务退出：丢弃当前 latent、候选数减半，并明确返回零速度。
+                            old_samples = agent.num_sample_trajs
+                            agent.num_sample_trajs = max(1, old_samples // 2)
+                            agent.output_latent = None
+                            agent.output_action = None
+                            torch.cuda.empty_cache()
+                            result = {
+                                "sequence": metadata["sequence"],
+                                "llm_output": agent.llm_output,
+                                "pixel_goal": None,
+                                "trajectory": None,
+                                "actions": [0],
+                                "cmd_vel": {"vx": 0.0, "wz": 0.0},
+                                "inference_seconds": time.monotonic() - started,
+                                "warning": (
+                                    f"System 1 CUDA OOM；候选轨迹数从 {old_samples} "
+                                    f"降为 {agent.num_sample_trajs}，本帧停止"
+                                ),
+                            }
+                            send_packet(connection, result)
+                            print(f"[DualVLN][显存降级] {result['warning']}: {error}")
+                            continue
+                            # ==================== 中文修改：System 1 OOM 安全降级（结束） ====================
                         trajectory = None
                         actions = None
                         if output.output_trajectory is not None:
-                            trajectory = output.output_trajectory.detach().cpu().numpy().tolist()
+                            # 中文修复：官方 traj_to_actions 返回 NumPy；同时兼容未来的 Tensor 返回值。
+                            trajectory_output = output.output_trajectory
+                            if hasattr(trajectory_output, "detach"):
+                                trajectory_output = trajectory_output.detach().cpu().numpy()
+                            trajectory = np.asarray(trajectory_output).tolist()
                             vx, wz = trajectory_to_command(trajectory, args.max_vx, args.max_wz)
                         else:
                             actions = output.output_action
