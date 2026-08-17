@@ -1,0 +1,49 @@
+diff --git a/internnav/agent/internvla_n1_agent_realworld.py b/internnav/agent/internvla_n1_agent_realworld.py
+--- a/internnav/agent/internvla_n1_agent_realworld.py
++++ b/internnav/agent/internvla_n1_agent_realworld.py
+@@ -31,7 +31,10 @@ class InternVLAN1AsyncAgent:
+         self.model = InternVLAN1ForCausalLM.from_pretrained(
+             args.model_path,
+             torch_dtype=torch.bfloat16,
+-            attn_implementation="flash_attention_2",
++            # ==================== RTX 5090 兼容修改（开始） ====================
++            # 使用 PyTorch SDPA，避免加载与本机 PyTorch/CUDA ABI 不兼容的 flash-attn wheel。
++            attn_implementation="sdpa",
++            # ==================== RTX 5090 兼容修改（结束） ====================
+             device_map={"": self.device},
+         )
+         self.model.eval()
+@@ -157,6 +160,11 @@ class InternVLAN1AsyncAgent:
+                 .unsqueeze(-1)
+                 .to(self.device)
+             )
++            # ==================== 中文修改：System 1 推理前释放缓存（开始） ====================
++            # System 2 已禁用 KV cache；归还不活跃缓存块，降低轨迹扩散模型峰值显存。
++            if torch.cuda.is_available():
++                torch.cuda.empty_cache()
++            # ==================== 中文修改：System 1 推理前释放缓存（结束） ====================
+             trajectories = self.step_s1(self.output_latent, rgbs, depths)
+ 
+             dual_sys_output.output_trajectory = traj_to_actions(trajectories, use_discrate_action=False)
+@@ -222,7 +230,10 @@ class InternVLAN1AsyncAgent:
+                 **inputs,
+                 max_new_tokens=128,
+                 do_sample=False,
+-                # use_cache=True,
++                # ==================== Isaac + DualVLN 联合显存优化（开始） ====================
++                # 当前实时包装器没有复用 past_key_values；关闭缓存，为 System 1 留显存。
++                use_cache=False,
++                # ==================== Isaac + DualVLN 联合显存优化（结束） ====================
+                 # past_key_values=self.past_key_values,
+                 return_dict_in_generate=True,
+                 # raw_input_ids=copy.deepcopy(inputs.input_ids),
+@@ -236,5 +247,8 @@ class InternVLAN1AsyncAgent:
+         with open(f"{self.save_dir}/llm_output_{self.episode_idx: 04d}.txt", 'w') as f:
+             f.write(self.llm_output)
+         self.last_output_ids = copy.deepcopy(output_ids[0])
+-        self.past_key_values = copy.deepcopy(outputs.past_key_values)
++        # ==================== Isaac + DualVLN 联合显存优化（开始） ====================
++        # use_cache=False 时不保存未使用的生成缓存。
++        self.past_key_values = None
++        # ==================== Isaac + DualVLN 联合显存优化（结束） ====================
+         print(f"output {self.episode_idx}  {self.llm_output} cost: {t1 - t0}s")

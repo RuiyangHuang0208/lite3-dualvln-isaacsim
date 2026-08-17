@@ -29,6 +29,13 @@
 docker/artifacts/
 *.tmp
 
+# DualVLN/Isaac 本地文件：不提交缓存、备份和外部大模型权重
+*.bak
+*.bak-*
+*.whl
+checkpoints/InternVLA-N1-DualVLN/
+assets/realworld_sample_data*/
+
 # Isaac-Sim packman
 _isaac_sim*
 _repo

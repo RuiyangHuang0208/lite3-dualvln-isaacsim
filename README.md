@@ -1,5 +1,8 @@
 # rl_training
 
+> 本分支加入 Lite3 + Isaac Sim 5.1 + ROS 2 + DualVLN 办公室导航闭环。
+> 中文安装、补丁与三终端启动方法见 [docs/DUALVLN_SIM_ZH.md](docs/DUALVLN_SIM_ZH.md)。
+
 [![IsaacSim](https://img.shields.io/badge/IsaacSim-5.1.0-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
 [![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.3.2-silver)](https://isaac-sim.github.io/IsaacLab)
 [![Discord](https://img.shields.io/badge/-Discord-5865F2?style=flat&logo=Discord&logoColor=white)](https://discord.gg/gdM9mQutC8)
