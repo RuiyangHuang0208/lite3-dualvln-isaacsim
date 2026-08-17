@@ -1,0 +1,198 @@
+From 8f39b0542647e6e6d9cd2bbab93789828347bbd1 Mon Sep 17 00:00:00 2001
+From: RuiyangHuang0208 <RuiyangHuang0208@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 12:06:07 +0200
+Subject: [PATCH 2/2] fix: match official AwareVLN reasoning action interface
+
+---
+ scripts/inference_only_demo.py | 130 +++++++++++++++++++++++++++------
+ 1 file changed, 106 insertions(+), 24 deletions(-)
+
+diff --git a/scripts/inference_only_demo.py b/scripts/inference_only_demo.py
+index f6eac26..71748b1 100644
+--- a/scripts/inference_only_demo.py
++++ b/scripts/inference_only_demo.py
+@@ -1,9 +1,12 @@
+ #!/usr/bin/env python3
+-"""AwareVLN 独立8帧推理验证，不依赖 Habitat、Isaac Sim 或 ROS 2。"""
++"""AwareVLN 独立推理：历史 RGB + 指令 → reasoning 或参数化动作 JSON。"""
+ 
+ import argparse
++import json
++import re
+ from pathlib import Path
+ 
++import numpy as np
+ import torch
+ from PIL import Image
+ 
+@@ -13,47 +16,112 @@ from llava.mm_utils import KeywordsStoppingCriteria, get_model_name_from_path, p
+ from llava.model.builder import load_pretrained_model
+ from llava.utils import disable_torch_init
+ 
++REASON_TOKEN = "<BEGIN_OF_REASONING>"
++ACT_TOKEN = "<BEGIN_OF_ACTION>"
++
+ 
+ def parse_args():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--model-path", type=Path, default=Path("ck/awarevln"))
+     parser.add_argument("--image-dir", type=Path, required=True)
+     parser.add_argument("--instruction", required=True)
++    parser.add_argument("--previous-reasoning", default="", help="上一次 reasoning；首次推理留空。")
++    parser.add_argument("--steps-since-reasoning", type=int, default=0)
+     parser.add_argument("--load-4bit", action="store_true", help="低显存验证模式；输出可能与 FP16 略有差异。")
+-    parser.add_argument("--max-new-tokens", type=int, default=128)
++    parser.add_argument("--max-new-tokens", type=int, default=256)
++    parser.add_argument("--json-output", type=Path, default=None)
+     return parser.parse_args()
+ 
+ 
++def sample_and_pad_images(images, num_frames=8, width=512, height=512):
++    """复现官方评估：历史不足时前补黑帧，历史过长时均匀采样并保留最新帧。"""
++    frames = list(images)
++    if not frames:
++        raise ValueError("图像目录中至少需要一张 RGB 图像")
++    while len(frames) < num_frames:
++        frames.insert(0, Image.new("RGB", (width, height), color=(0, 0, 0)))
++    latest = frames[-1]
++    indices = np.linspace(0, len(frames) - 1, num=num_frames - 1, endpoint=False, dtype=int)
++    return [frames[index] for index in indices] + [latest]
++
++
++def build_question(instruction, previous_reasoning, steps_since_reasoning):
++    """构造与官方 AwareVLNTrainer 一致的 reasoning/action 二选一提示词。"""
++    history_tokens = "<image>\n" * 7
++    prefix = (
++        "Imagine you are a robot programmed for navigation tasks. You have been given a video "
++        f"of historical observations {history_tokens}, and current observation <image>\n. "
++        f'Your assigned task is: "{instruction}". '
++    )
++    if previous_reasoning:
++        prefix += f'The reasoning from {steps_since_reasoning} steps ago was: "{previous_reasoning}". '
++    return prefix + (
++        "Analyze this series of images to decide whether to predict the next action or to perform reasoning. "
++        "If action prediction, decide your next action, which could be turning left or right by a specific degree, "
++        "moving forward a certain distance, or stop if the task is completed. "
++        "If reasoning, describe your current observations, assess task progress, and provide a high-level plan "
++        "for the next steps."
++    )
++
++
++def clean_content(text):
++    for token in ("<|begin_of_text|>", "<|end_of_text|>", "<END_OF_REASONING>"):
++        text = re.sub(re.escape(token), "", text, flags=re.IGNORECASE)
++    return text.strip(" '\"\n\t")
++
++
++def nearest(value, choices):
++    return min(choices, key=lambda choice: abs(choice - value))
++
++
++def parse_awarevln_output(raw_output):
++    """把官方文本输出解析为稳定接口，供后续 ROS 2 控制器使用。"""
++    output = raw_output.strip()
++    mode = "reason" if output.lower().startswith(REASON_TOKEN.lower()) else "action"
++    if mode == "reason":
++        content = output[len(REASON_TOKEN) :]
++        return {"mode": "reason", "reasoning": clean_content(content), "action": None}
++
++    if output.lower().startswith(ACT_TOKEN.lower()):
++        output = output[len(ACT_TOKEN) :]
++    content = clean_content(output)
++    result = {"mode": "action", "reasoning": None, "action": "forward", "distance_cm": 25}
++    if re.search(r"\bstop\b", content, re.IGNORECASE):
++        result = {"mode": "action", "reasoning": None, "action": "stop"}
++    elif match := re.search(r"turn\s+left(?:\s+(\d+)\s*degree)?", content, re.IGNORECASE):
++        degree = nearest(int(match.group(1) or 15), (15, 30, 45))
++        result = {"mode": "action", "reasoning": None, "action": "left", "degree": degree}
++    elif match := re.search(r"turn\s+right(?:\s+(\d+)\s*degree)?", content, re.IGNORECASE):
++        degree = nearest(int(match.group(1) or 15), (15, 30, 45))
++        result = {"mode": "action", "reasoning": None, "action": "right", "degree": degree}
++    elif match := re.search(r"move\s+forward(?:\s+(\d+)\s*cm)?", content, re.IGNORECASE):
++        distance = nearest(int(match.group(1) or 25), (25, 50, 75))
++        result["distance_cm"] = distance
++    result["content"] = content
++    return result
++
++
+ def main():
+     args = parse_args()
+     model_path = args.model_path.expanduser().resolve()
+     image_dir = args.image_dir.expanduser().resolve()
+ 
+-    # ==================== 中文修改：严格检查 AwareVLN 的8帧输入（开始） ====================
++    # ==================== 中文修改：AwareVLN 官方历史帧采样输入（开始） ====================
+     image_paths = sorted(
+         path for path in image_dir.iterdir() if path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+     )
+-    if len(image_paths) != 8:
+-        raise ValueError(f"AwareVLN 需要正好8帧，当前目录包含 {len(image_paths)} 帧：{image_dir}")
+-    images = [Image.open(path).convert("RGB") for path in image_paths]
+-    # ==================== 中文修改：严格检查 AwareVLN 的8帧输入（结束） ====================
++    source_images = [Image.open(path).convert("RGB") for path in image_paths]
++    images = sample_and_pad_images(source_images, num_frames=8)
++    # ==================== 中文修改：AwareVLN 官方历史帧采样输入（结束） ====================
+ 
+     disable_torch_init()
+     model_name = get_model_name_from_path(str(model_path))
+     tokenizer, model, image_processor, _ = load_pretrained_model(
+         str(model_path), model_name, load_4bit=args.load_4bit, device_map="auto"
+     )
+-
+-    image_token = "<image>\n"
+-    prompt_text = (
+-        "Imagine you are a robot programmed for navigation tasks. You have been given a video "
+-        f"of historical observations {image_token * 7}, and current observation <image>\n. "
+-        f'Your assigned task is: "{args.instruction}" Analyze this series of images to decide your next action, '
+-        "which could be turning left or right by a specific degree, moving forward a certain distance, "
+-        "or stop if the task is completed."
+-    )
++    question = build_question(args.instruction, args.previous_reasoning, args.steps_since_reasoning)
+     conversation = conv_templates["llama_3"].copy()
+-    conversation.append_message(conversation.roles[0], prompt_text)
++    conversation.append_message(conversation.roles[0], question)
+     conversation.append_message(conversation.roles[1], None)
+     prompt = conversation.get_prompt()
+ 
+@@ -69,17 +137,31 @@ def main():
+             images=image_tensor,
+             do_sample=False,
+             max_new_tokens=args.max_new_tokens,
+-            # ==================== 中文修改：联合仿真前先降低推理峰值显存（开始） ====================
++            # ==================== 中文修改：降低单卡推理峰值显存（开始） ====================
+             use_cache=False,
+-            # ==================== 中文修改：联合仿真前先降低推理峰值显存（结束） ====================
++            # ==================== 中文修改：降低单卡推理峰值显存（结束） ====================
+             stopping_criteria=[stopping],
+             pad_token_id=tokenizer.eos_token_id,
+         )
+-    output = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+-    if output.endswith(stop_text):
+-        output = output[: -len(stop_text)].strip()
+-    print("AwareVLN output:")
+-    print(output)
++
++    # 必须保留 special tokens，否则会丢失决定输出类型的 REASON/ACT 标记。
++    raw_output = tokenizer.batch_decode(output_ids, skip_special_tokens=False)[0].strip()
++    for suffix in (stop_text, conversation.sep2):
++        if suffix and raw_output.endswith(suffix):
++            raw_output = raw_output[: -len(suffix)].strip()
++    parsed = parse_awarevln_output(raw_output)
++    result = {
++        "instruction": args.instruction,
++        "source_frame_count": len(source_images),
++        "model_frame_count": len(images),
++        "raw_output": raw_output,
++        **parsed,
++    }
++    rendered = json.dumps(result, ensure_ascii=False, indent=2)
++    print(rendered)
++    if args.json_output is not None:
++        args.json_output.parent.mkdir(parents=True, exist_ok=True)
++        args.json_output.write_text(rendered + "\n", encoding="utf-8")
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.43.0
+

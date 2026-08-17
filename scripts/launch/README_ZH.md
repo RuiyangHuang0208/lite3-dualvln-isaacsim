@@ -34,6 +34,15 @@ bash scripts/launch/dualvln/03_start_gateway.sh
 
 ## AwareVLN：独立推理
 
+首次安装官方 AwareVLN 后，在本仓库根目录应用 RTX 5090 和正确输入输出接口补丁：
+
+```bash
+git -C "$HOME/lite3_isaac_ws/AwareVLN" am \
+  "$(pwd)"/patches/awarevln/*.patch
+```
+
+这两个补丁只修改独立的 AwareVLN 仓库，不会修改 DualVLN/InternNav。
+
 ```bash
 AWAREVLN_INSTRUCTION="go to the sofa" \
   bash scripts/launch/awarevln/01_run_inference.sh
