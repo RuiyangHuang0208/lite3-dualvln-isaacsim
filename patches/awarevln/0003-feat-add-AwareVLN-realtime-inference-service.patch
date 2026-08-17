@@ -1,0 +1,204 @@
+From 3f76482793929491d0aa56ce37fef35b55d42878 Mon Sep 17 00:00:00 2001
+From: RuiyangHuang0208 <RuiyangHuang0208@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 12:27:42 +0200
+Subject: [PATCH] feat: add AwareVLN realtime inference service
+
+---
+ scripts/awarevln_ros2_node.py | 185 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 185 insertions(+)
+ create mode 100644 scripts/awarevln_ros2_node.py
+
+diff --git a/scripts/awarevln_ros2_node.py b/scripts/awarevln_ros2_node.py
+new file mode 100644
+index 0000000..b491afd
+--- /dev/null
++++ b/scripts/awarevln_ros2_node.py
+@@ -0,0 +1,185 @@
++#!/usr/bin/env python3
++"""AwareVLN 实时推理服务（Python 3.10），通过本机 TCP 与 ROS 2 网关通信。"""
++
++import argparse
++import json
++import math
++import socket
++import struct
++import time
++from collections import deque
++from pathlib import Path
++
++import numpy as np
++import torch
++from PIL import Image
++
++from llava.constants import IMAGE_TOKEN_INDEX
++from llava.conversation import SeparatorStyle, conv_templates
++from llava.mm_utils import KeywordsStoppingCriteria, get_model_name_from_path, process_images, tokenizer_image_token
++from llava.model.builder import load_pretrained_model
++from llava.utils import disable_torch_init
++# 中文修改：本文件按 `python scripts/awarevln_ros2_node.py` 直接执行，复用同目录工具。
++from inference_only_demo import build_question, parse_awarevln_output, sample_and_pad_images
++
++
++def receive_exact(connection, size):
++    chunks = []
++    while size:
++        chunk = connection.recv(size)
++        if not chunk:
++            raise ConnectionError("AwareVLN ROS 2 网关已断开")
++        chunks.append(chunk)
++        size -= len(chunk)
++    return b"".join(chunks)
++
++
++def receive_frame(connection):
++    metadata_size = struct.unpack("!I", receive_exact(connection, 4))[0]
++    metadata = json.loads(receive_exact(connection, metadata_size).decode("utf-8"))
++    image = receive_exact(connection, int(metadata["image_bytes"]))
++    return metadata, image
++
++
++def send_result(connection, result):
++    payload = json.dumps(result, ensure_ascii=False).encode("utf-8")
++    connection.sendall(struct.pack("!I", len(payload)) + payload)
++
++
++def action_to_command(parsed, max_vx, max_wz, max_duration):
++    """把 AwareVLN 参数化动作转换为速度和开环执行时间。"""
++    action = parsed.get("action")
++    if parsed.get("mode") != "action" or action == "stop" or action is None:
++        return {"vx": 0.0, "wz": 0.0, "duration": 0.0}
++    if action == "forward":
++        distance_m = float(parsed.get("distance_cm", 25)) / 100.0
++        duration = min(max_duration, distance_m / max_vx)
++        return {"vx": max_vx, "wz": 0.0, "duration": duration}
++    degree = float(parsed.get("degree", 15))
++    duration = min(max_duration, math.radians(degree) / max_wz)
++    direction = 1.0 if action == "left" else -1.0
++    return {"vx": 0.0, "wz": direction * max_wz, "duration": duration}
++
++
++class AwareVLNRealtimeAgent:
++    """维护 RGB 历史与 reasoning 上下文的单机器人 AwareVLN 包装器。"""
++
++    def __init__(self, model_path, instruction, load_4bit, max_new_tokens):
++        disable_torch_init()
++        model_name = get_model_name_from_path(str(model_path))
++        self.tokenizer, self.model, self.image_processor, _ = load_pretrained_model(
++            str(model_path), model_name, load_4bit=load_4bit, device_map="auto"
++        )
++        self.instruction = instruction
++        self.max_new_tokens = max_new_tokens
++        self.history = deque(maxlen=64)
++        self.last_reasoning = ""
++        self.steps_since_reasoning = 0
++
++    def step(self, rgb):
++        self.history.append(Image.fromarray(rgb).convert("RGB"))
++        images = sample_and_pad_images(list(self.history), num_frames=8)
++        question = build_question(self.instruction, self.last_reasoning, self.steps_since_reasoning)
++        conversation = conv_templates["llama_3"].copy()
++        conversation.append_message(conversation.roles[0], question)
++        conversation.append_message(conversation.roles[1], None)
++        prompt = conversation.get_prompt()
++
++        image_tensor = process_images(images, self.image_processor, self.model.config).to(
++            self.model.device, dtype=torch.float16
++        )
++        input_ids = tokenizer_image_token(
++            prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
++        ).unsqueeze(0).to(self.model.device)
++        stop_text = conversation.sep if conversation.sep_style != SeparatorStyle.TWO else conversation.sep2
++        stopping = KeywordsStoppingCriteria([stop_text], self.tokenizer, input_ids)
++
++        with torch.inference_mode():
++            output_ids = self.model.generate(
++                input_ids,
++                images=image_tensor,
++                do_sample=False,
++                max_new_tokens=self.max_new_tokens,
++                # ==================== 中文修改：实时闭环降低峰值显存（开始） ====================
++                use_cache=False,
++                # ==================== 中文修改：实时闭环降低峰值显存（结束） ====================
++                stopping_criteria=[stopping],
++                pad_token_id=self.tokenizer.eos_token_id,
++            )
++        raw_output = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)[0].strip()
++        for suffix in (stop_text, conversation.sep2):
++            if suffix and raw_output.endswith(suffix):
++                raw_output = raw_output[: -len(suffix)].strip()
++        parsed = parse_awarevln_output(raw_output)
++        if parsed["mode"] == "reason":
++            self.last_reasoning = parsed["reasoning"]
++            self.steps_since_reasoning = 0
++        else:
++            self.steps_since_reasoning += 1
++        return raw_output, parsed
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--instruction", required=True)
++    parser.add_argument("--model-path", type=Path, default=Path("ck/awarevln"))
++    parser.add_argument("--host", default="127.0.0.1")
++    parser.add_argument("--port", type=int, default=8766)
++    parser.add_argument("--max-vx", type=float, default=0.15)
++    parser.add_argument("--max-wz", type=float, default=0.20)
++    parser.add_argument("--max-duration", type=float, default=5.0)
++    parser.add_argument("--max-new-tokens", type=int, default=256)
++    parser.add_argument("--fp16", action="store_true", help="使用 FP16；默认4-bit以便与 Isaac Sim 共用显存。")
++    args = parser.parse_args()
++    if min(args.max_vx, args.max_wz, args.max_duration) <= 0:
++        parser.error("速度和最长执行时间必须大于零")
++    return args
++
++
++def main():
++    args = parse_args()
++    model_path = args.model_path.expanduser().resolve()
++    print(f"[AwareVLN] 正在加载模型：{model_path} ({'FP16' if args.fp16 else '4-bit'})")
++    agent = AwareVLNRealtimeAgent(model_path, args.instruction, not args.fp16, args.max_new_tokens)
++    print("[AwareVLN] 模型已就绪")
++
++    # ==================== 中文修改：AwareVLN 独立 TCP 服务（开始） ====================
++    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
++        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++        server.bind((args.host, args.port))
++        server.listen(1)
++        print(f"[AwareVLN] 等待 ROS 2 网关：{args.host}:{args.port}")
++        while True:
++            connection, address = server.accept()
++            print(f"[AwareVLN] ROS 2 网关已连接：{address}")
++            try:
++                with connection:
++                    while True:
++                        metadata, image_bytes = receive_frame(connection)
++                        height, width = int(metadata["height"]), int(metadata["width"])
++                        rgb = np.frombuffer(image_bytes, dtype=np.uint8).reshape(height, width, 3).copy()
++                        started = time.monotonic()
++                        raw_output, parsed = agent.step(rgb)
++                        command = action_to_command(
++                            parsed, args.max_vx, args.max_wz, args.max_duration
++                        )
++                        result = {
++                            "sequence": metadata["sequence"],
++                            "raw_output": raw_output,
++                            **parsed,
++                            "cmd_vel": command,
++                            "inference_seconds": time.monotonic() - started,
++                        }
++                        send_result(connection, result)
++                        print(
++                            f"[AwareVLN] frame={metadata['sequence']} mode={parsed['mode']} "
++                            f"action={parsed.get('action')} vx={command['vx']:.3f} "
++                            f"wz={command['wz']:.3f} duration={command['duration']:.2f}s"
++                        )
++            except (ConnectionError, BrokenPipeError, OSError) as error:
++                print(f"[AwareVLN] 网关断开，等待重连：{error}")
++    # ==================== 中文修改：AwareVLN 独立 TCP 服务（结束） ====================
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
