@@ -14,6 +14,7 @@ import struct
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def receive_exact(connection, size):
@@ -109,17 +110,19 @@ def main():
     from internnav.agent.internvla_n1_agent_realworld import InternVLAN1AsyncAgent
 
     # ==================== DualVLN 模型参数：保持与官方 demo 一致（开始） ====================
-    class AgentArgs:
-        device = "cuda:0"
-        model_path = str(model_path)
-        resize_w = 384
-        resize_h = 384
-        num_history = 8
-        plan_step_gap = 4
+    # 中文修复：函数局部变量不能在同名 class 属性表达式中可靠引用，改用显式参数对象。
+    agent_args = SimpleNamespace(
+        device="cuda:0",
+        model_path=str(model_path),
+        resize_w=384,
+        resize_h=384,
+        num_history=8,
+        plan_step_gap=4,
+    )
     # ==================== DualVLN 模型参数：保持与官方 demo 一致（结束） ====================
 
     print(f"[DualVLN] 正在加载模型：{model_path}")
-    agent = InternVLAN1AsyncAgent(AgentArgs())
+    agent = InternVLAN1AsyncAgent(agent_args)
     agent.reset()
     print("[DualVLN] 模型已就绪")
 
